@@ -12,11 +12,12 @@ Uso rápido (recomendado dentro de un venv o conda):
         --output_path resultado.png
 
 El script:
+
 1. Carga y pre-procesa la imagen de contenido y la de estilo.
 2. Carga un modelo VGG-19 preentrenado y define las pérdidas de contenido y estilo.
 3. Optimiza la imagen generada durante varias iteraciones.
-4. Des-normaliza la tensor final y lo guarda como PNG/JPG.
-
+4. Cada 50 pasos guarda una vista previa del progreso (progress_0000.png, progress_0050.png, …).
+5. Des-normaliza el tensor final y lo guarda en el archivo indicado (sin autocontrast).
 """
 
 import argparse
@@ -27,7 +28,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from PIL import Image
-from PIL import ImageOps
 from torchvision import models, transforms
 
 # ────────────────────────── Parámetros globales ──────────────────────────
@@ -38,15 +38,16 @@ DEVICE = (
     else torch.device("cpu")
 )
 
-IMSIZE = 512                         # Dimensión cuadrada
-STYLE_LAYERS = ["conv1_1", "conv2_1", "conv3_1", "conv4_1", "conv5_1"]
+IMSIZE = 512
+STYLE_LAYERS   = ["conv1_1", "conv2_1", "conv3_1", "conv4_1", "conv5_1"]
 CONTENT_LAYERS = ["conv4_2"]
 
-STYLE_WEIGHT   = 1e6     
-CONTENT_WEIGHT = 1  
+STYLE_WEIGHT   = 1e6
+CONTENT_WEIGHT = 1
 TV_WEIGHT      = 1e-6
-NUM_STEPS      = 400  
+NUM_STEPS      = 400          # ← ahora 400
 LR             = 0.03
+SAVE_EVERY     = 50           # guardar progreso cada 50 pasos
 
 # ──────────────────────────── Transformaciones ───────────────────────────
 
@@ -57,11 +58,13 @@ loader = transforms.Compose([
                          std =[0.229, 0.224, 0.225]),
 ])
 
+def undo_normalize(t: torch.Tensor) -> torch.Tensor:
+    mean = torch.tensor([0.485, 0.456, 0.406], device=t.device).view(3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device=t.device).view(3, 1, 1)
+    return t * std + mean
+
 unloader = transforms.Compose([
-    transforms.Normalize(mean=[ 0., 0., 0.],
-                         std =[1/0.229, 1/0.224, 1/0.225]),
-    transforms.Normalize(mean=[-0.485, -0.456, -0.406],
-                         std =[1.,     1.,     1.]),
+    transforms.Lambda(undo_normalize),
     transforms.Lambda(lambda x: torch.clamp(x, 0, 1)),
     transforms.ToPILImage(),
 ])
@@ -73,12 +76,8 @@ def load_image(path: Path) -> torch.Tensor:
     return loader(img).unsqueeze(0).to(DEVICE)
 
 def save_tensor(t: torch.Tensor, path: Path) -> None:
-    img = t.cpu().squeeze(0)
-    img = torch.clamp(img, 0, 1)  # <--- Corrige aquí el clamp
+    img = t.detach().cpu().squeeze(0)          # C, H, W
     pil_img = unloader(img)
-
-    pil_img = ImageOps.autocontrast(pil_img, cutoff=1)
-
     pil_img.save(path)
     print(f"✅ Imagen guardada en {path}")
 
@@ -141,7 +140,6 @@ def build_model(
 
     for layer in cnn.children():
         if isinstance(layer, nn.Conv2d):
-            # Gestionar nombres tipo conv{block}_{index}
             if conv_in_block == 0:
                 conv_block += 1
             conv_in_block += 1
@@ -180,14 +178,19 @@ def build_model(
 def run_style_transfer(
     model, input_img,
     style_losses, content_losses, tv_loss,
+    output_prefix: Path,
     num_steps=NUM_STEPS,
+    save_every=SAVE_EVERY,
     style_w=STYLE_WEIGHT, content_w=CONTENT_WEIGHT, tv_w=TV_WEIGHT
 ):
     optimizer = optim.LBFGS([input_img.requires_grad_()], lr=LR)
     print(f"🖼️  Optimizando en {DEVICE}…")
     step = [0]
 
-    while step[0] <= num_steps:
+    # Guarda el estado inicial (step 0)
+    save_tensor(input_img, output_prefix.with_name(f"{output_prefix.stem}_progress_{step[0]:04d}.png"))
+
+    while step[0] < num_steps:
 
         def closure():
             optimizer.zero_grad()
@@ -200,17 +203,22 @@ def run_style_transfer(
             loss = style_w * s_loss + content_w * c_loss + tv_w * t_loss
             loss.backward()
 
-            if step[0] % 50 == 0:
+            if step[0] % save_every == 0:
                 print(f"{step[0]:3d}/{num_steps}  "
                       f"Estilo: {s_loss.item():.4f}  "
                       f"Contenido: {c_loss.item():.4f}  "
                       f"TV: {t_loss.item():.4f}")
+                save_tensor(
+                    input_img,
+                    output_prefix.with_name(f"{output_prefix.stem}_progress_{step[0]:04d}.png")
+                )
+
             step[0] += 1
             return loss
 
         optimizer.step(closure)
 
-    input_img.data.clamp_(0, 1)
+    # Imagen final
     return input_img.detach()
 
 # ─────────────────────────────── Main ─────────────────────────────────────
@@ -223,10 +231,9 @@ def main():
     args = parser.parse_args()
 
     content_img = load_image(args.content_path)
-    style_img = load_image(args.style_path)
+    style_img   = load_image(args.style_path)
 
-    input_img = content_img.clone()    
-
+    input_img   = content_img.clone()
 
     cnn = models.vgg19(weights=models.VGG19_Weights.DEFAULT)
     model, s_losses, c_losses, tv_loss = build_model(
@@ -236,9 +243,13 @@ def main():
     print(f"Capas de estilo encontradas:   {len(s_losses)}")
     print(f"Capas de contenido encontradas: {len(c_losses)}")
 
-    output = run_style_transfer(model, input_img,
-                                s_losses, c_losses, tv_loss)
+    output = run_style_transfer(
+        model, input_img,
+        s_losses, c_losses, tv_loss,
+        output_prefix=args.output_path,
+    )
 
+    # Guarda la versión final
     save_tensor(output, args.output_path)
 
 if __name__ == "__main__":
