@@ -23,7 +23,7 @@ El script:
 import argparse
 from pathlib import Path
 from typing import List, Tuple
-
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -140,6 +140,7 @@ def build_model(
 
     for layer in cnn.children():
         if isinstance(layer, nn.Conv2d):
+            # Gestionar nombres tipo conv{block}_{index}
             if conv_in_block == 0:
                 conv_block += 1
             conv_in_block += 1
@@ -175,6 +176,7 @@ def build_model(
 
 # ──────────────────────── Bucle de optimización ──────────────────────────
 
+# ……………………… run_style_transfer ……………………………
 def run_style_transfer(
     model, input_img,
     style_losses, content_losses, tv_loss,
@@ -186,8 +188,8 @@ def run_style_transfer(
     optimizer = optim.LBFGS([input_img.requires_grad_()], lr=LR)
     print(f"🖼️  Optimizando en {DEVICE}…")
     step = [0]
+    loss_history = []
 
-    # Guarda el estado inicial (step 0)
     save_tensor(input_img, output_prefix.with_name(f"{output_prefix.stem}_progress_{step[0]:04d}.png"))
 
     while step[0] < num_steps:
@@ -213,13 +215,30 @@ def run_style_transfer(
                     output_prefix.with_name(f"{output_prefix.stem}_progress_{step[0]:04d}.png")
                 )
 
+            # ---- guarda pérdidas en la lista ----
+            loss_history.append(loss.item())        # ← NUEVO
+
             step[0] += 1
             return loss
 
         optimizer.step(closure)
 
-    # Imagen final
-    return input_img.detach()
+    # ➊ Devuelve imagen
+    result = input_img.detach()
+
+    # ➋ Genera la gráfica y guárdala
+    plt.figure(figsize=(6,4))
+    plt.plot(loss_history)
+    plt.title("Curva de pérdida total")
+    plt.xlabel("Iteración")
+    plt.ylabel("Loss")
+    curve_path = output_prefix.with_name(f"{output_prefix.stem}_loss_curve.png")
+    plt.tight_layout()
+    plt.savefig(curve_path)
+    plt.close()
+    print(f"📈 Gráfica guardada en {curve_path}")
+
+    return result
 
 # ─────────────────────────────── Main ─────────────────────────────────────
 
